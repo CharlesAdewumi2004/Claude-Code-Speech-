@@ -1,0 +1,11 @@
+{
+  "name": "speech-marketplace",
+  "owner": { "name": "charlie" },
+  "plugins": [
+    {
+      "name": "speech",
+      "source": "./",
+      "description": "Speak Claude's replies aloud with a neural voice, only when you dictated the message."
+    }
+  ]
+}

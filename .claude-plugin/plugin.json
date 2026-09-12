@@ -1,0 +1,6 @@
+{
+  "name": "speech",
+  "description": "Reads Claude's replies aloud with a neural voice. Speaks only what you dictate, stays silent on what you type, and stops on command.",
+  "version": "1.0.0",
+  "keywords": ["voice", "tts", "speech", "accessibility", "dictation"]
+}
