@@ -29,7 +29,7 @@ import time
 # ---- knobs (env-overridable so users don't edit the file) ----------------
 VOICE = os.environ.get("CLAUDE_SPEECH_VOICE", "en-US-AndrewNeural")
 RATE = os.environ.get("CLAUDE_SPEECH_RATE", "+8%")
-MAX_CHARS = int(os.environ.get("CLAUDE_SPEECH_MAX_CHARS", "1200"))
+MAX_CHARS = int(os.environ.get("CLAUDE_SPEECH_MAX_CHARS", "3000"))
 CHARS_PER_SEC = 13.0           # rough read speed, used only as a safety cap
 REPLY_WAIT = float(os.environ.get("CLAUDE_SPEECH_REPLY_WAIT", "2.0"))
 REPLY_POLL = 0.05              # how often to re-read while the reply lands
@@ -453,26 +453,48 @@ def find_player():
     return None
 
 
-def _chunks(text, opener=1, size=300):
+def _chunks(text, opener=55, size=300):
     """Split a reply into pieces that can be spoken as they become ready.
 
-    The first piece is a single sentence, so the first sound arrives after
-    synthesising a dozen words rather than the whole reply. The rest go in
-    larger pieces, synthesised while the opening is still playing.
+    The opening piece is kept short so the first sound arrives quickly, but
+    not so short that it finishes before the next piece is ready - a one
+    word sentence ("Cool.") plays for half a second and leaves an audible
+    gap behind it, so sentences are added until it is worth a few seconds
+    of speech.
     """
     parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
-    if not parts:
-        return []
-    out = [" ".join(parts[:opener])]
+    out = []
     buf = ""
-    for part in parts[opener:]:
+    for part in parts:
         buf = (buf + " " + part) if buf else part
-        if len(buf) >= size:
+        if len(buf) >= (opener if not out else size):
             out.append(buf)
             buf = ""
     if buf:
         out.append(buf)
     return out
+
+
+def _synthesize_all(pieces, paths, workers=4):
+    """Synthesise every piece concurrently, yielding results in order.
+
+    These are network calls, so overlapping them costs nothing and the
+    later pieces are ready by the time the opening finishes playing. Every
+    future is drained even after a failure, so no thread is still writing
+    when the caller cleans up.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(pieces)))
+    try:
+        futures = [pool.submit(synthesize, piece, path)
+                   for piece, path in zip(pieces, paths)]
+        for fut in futures:
+            try:
+                yield fut.result()
+            except Exception:
+                yield False
+    finally:
+        pool.shutdown(wait=True)
 
 
 def _tidy_previous():
@@ -498,20 +520,25 @@ def _neural_posix(text):
     made = []
     player = None
     try:
-        for i, piece in enumerate(pieces):
+        outs = []
+        for i in range(len(pieces)):
             out = "%s%d.mp3" % (stem, i)
             part = out + ".part"
             TEMP_FILES.extend((part, out))
             made.extend((part, out))
-            if not synthesize(piece, part):
+            outs.append((part, out))
+        stop = False
+        for i, ok in enumerate(_synthesize_all(pieces, [o[0] for o in outs])):
+            if stop or not ok:
                 if i == 0:
                     return False
-                break            # keep what played rather than losing it all
-            os.replace(part, out)
+                stop = True      # keep what played rather than losing it all
+                continue
+            os.replace(outs[i][0], outs[i][1])
             if player:
-                player.wait()    # this piece was synthesised while that played
+                player.wait()
             player = subprocess.Popen(
-                [a.replace("{f}", out) for a in argv],
+                [a.replace("{f}", outs[i][1]) for a in argv],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if player:
             player.wait()
@@ -582,15 +609,22 @@ def _neural_wsl(text):
         player = subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        spoken = 0
-        for i, piece in enumerate(pieces):
+        outs = []
+        for i in range(len(pieces)):
             out = "%s%d.mp3" % (wsl_stem, i)
             part = out + ".part"
             TEMP_FILES.extend((part, out))
             made.extend((part, out))
-            if not synthesize(piece, part):
-                break
-            os.replace(part, out)   # atomic: never a half-written file
+            outs.append((part, out))
+        spoken = 0
+        stop = False
+        # all at once, handed to the player in order: synthesising piece two
+        # only after piece one is written is what leaves a gap between them
+        for i, ok in enumerate(_synthesize_all(pieces, [o[0] for o in outs])):
+            if stop or not ok:
+                stop = True
+                continue
+            os.replace(outs[i][0], outs[i][1])   # atomic: never a part file
             spoken += 1
         open(wsl_done, "w").close()  # nothing more is coming
         if not spoken:

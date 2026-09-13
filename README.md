@@ -92,10 +92,15 @@ List the available voices with
 
 ## A voice terminal of its own
 
-The mode lives in a file, so every session shares it. Set `CLAUDE_SPEECH_MODE`
-instead and it applies to one terminal only, which is what makes a spoken
-session and a written session genuinely separate rather than two windows
-fighting over one setting.
+The idea is two terminals, not one that switches. Your usual terminal stays
+written: silent, dense, structured answers, and whichever model you normally
+work in. A second terminal is the spoken one, and everything about it is set
+before it starts.
+
+The mode lives in a file, so every session would otherwise share it and both
+terminals would talk. Set `CLAUDE_SPEECH_MODE` and it applies to one terminal
+only, which is what keeps the two genuinely separate. Leave the shared mode on
+`off` so only the launcher turns speech on.
 
 ```
 voice() {
@@ -131,12 +136,13 @@ implemented but have not been tested on those platforms.
 The Stop hook returns in under 90ms, because all the real work happens in a
 detached child process and Claude Code is never left waiting on it.
 
-The reply is spoken in pieces rather than as one lump. The first piece is a
-single sentence, so the first sound arrives once a dozen words have been
-synthesised instead of the whole answer; the rest are synthesised while that
-opening sentence is still playing. On a short reply that takes time to first
-audio from about 3.3s down to about 1.1s, and the saving grows with length.
-Roughly a second of that is the speech service connecting, which is the floor.
+The reply is spoken in pieces rather than as one lump, so the first sound
+arrives once a short opening has been synthesised instead of the whole answer.
+Every piece is synthesised at the same time and handed to the player in order.
+Doing them one after another is what leaves an audible gap: the next piece only
+starts once the one before it is written, and a brief opening runs out before
+it arrives. The opening is kept to a few seconds of speech for the same reason,
+since a one word sentence buys no cover at all.
 
 The player starts before the first piece exists and waits for it, so its own
 startup overlaps synthesis too. Each piece is renamed into place atomically,
