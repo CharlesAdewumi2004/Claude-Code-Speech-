@@ -66,6 +66,7 @@ Environment variables, all optional:
 | `CLAUDE_SPEECH_RATE` | `+8%` | Speaking speed |
 | `CLAUDE_SPEECH_MAX_CHARS` | `450` | Cut-off length |
 | `CLAUDE_SPEECH_HOME` | `~/.claude/speech` | Where state lives |
+| `CLAUDE_SPEECH_REPLY_WAIT` | `2.0` | Seconds to wait for the reply to land |
 
 List the available voices with
 `~/.claude/speech/.venv/bin/edge-tts --list-voices`. The conversational ones

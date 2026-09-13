@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Speak Claude Code's replies aloud.
 
-Stop hook. Pulls the last assistant message out of the transcript, strips the
-things that don't read well aloud, and plays it.
+Stop hook. Pulls the reply from the turn that just ended out of the transcript,
+strips the things that don't read well aloud, and plays it.
 
 Voice: edge-tts neural voices when available (free, no account, needs network),
 falling back to whatever the OS ships with.
@@ -23,12 +23,15 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 
 # ---- knobs (env-overridable so users don't edit the file) ----------------
 VOICE = os.environ.get("CLAUDE_SPEECH_VOICE", "en-US-AndrewNeural")
 RATE = os.environ.get("CLAUDE_SPEECH_RATE", "+8%")
 MAX_CHARS = int(os.environ.get("CLAUDE_SPEECH_MAX_CHARS", "450"))
 CHARS_PER_SEC = 13.0           # rough read speed, used only as a safety cap
+REPLY_WAIT = float(os.environ.get("CLAUDE_SPEECH_REPLY_WAIT", "2.0"))
+REPLY_POLL = 0.05              # how often to re-read while the reply lands
 # --------------------------------------------------------------------------
 
 STATE_DIR = os.path.expanduser(
@@ -137,18 +140,11 @@ def _text_of(message):
                      if isinstance(b, dict) and b.get("type") == "text")
 
 
-def last_assistant_text(transcript_path):
-    for entry in reversed(_iter_entries(transcript_path)):
-        message = entry.get("message") or {}
-        if message.get("role") == "assistant":
-            text = _text_of(message)
-            if text.strip():
-                return text
-    return None
-
-
-def last_user_text(transcript_path):
-    for entry in reversed(_iter_entries(transcript_path)):
+def _last_human_index(entries):
+    """Position of the most recent message the user actually sent.
+    -1 when there isn't one, so callers can slice from 0."""
+    idx = -1
+    for i, entry in enumerate(entries):
         if entry.get("isMeta") or entry.get("turnCompanion"):
             continue
         if (entry.get("origin") or {}).get("kind") != "human":
@@ -158,8 +154,41 @@ def last_user_text(transcript_path):
             continue
         text = _text_of(message).strip()
         if text and not text.startswith("<"):
-            return text
-    return None
+            idx = i
+    return idx
+
+
+def last_user_text(transcript_path):
+    entries = _iter_entries(transcript_path)
+    idx = _last_human_index(entries)
+    if idx < 0:
+        return None
+    return _text_of(entries[idx]["message"]).strip()
+
+
+def reply_text(transcript_path, wait=REPLY_WAIT):
+    """The reply from the turn that just ended, or None.
+
+    Anchored to the last human message, because anything at or before it
+    belongs to an older turn. Claude Code writes the transcript from a
+    different process, so the closing text block can land a moment after
+    the Stop hook fires; we wait for it rather than scan further back and
+    speak the previous turn's reply. A turn that ends on a tool call has
+    no text at all, and silence is the right answer there.
+    """
+    deadline = time.time() + wait
+    while True:
+        entries = _iter_entries(transcript_path)
+        for entry in reversed(entries[_last_human_index(entries) + 1:]):
+            message = entry.get("message") or {}
+            if message.get("role") != "assistant":
+                continue
+            text = _text_of(message)
+            if text.strip():
+                return text
+        if time.time() >= deadline:
+            return None
+        time.sleep(REPLY_POLL)
 
 
 def looks_dictated(text):
@@ -659,7 +688,7 @@ def main():
     path = payload.get("transcript_path")
     if not path or not should_speak(path):
         return
-    text = last_assistant_text(path)
+    text = reply_text(path)
     if text:
         text = speakable(text)
         if text:
