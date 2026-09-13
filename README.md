@@ -128,9 +128,17 @@ implemented but have not been tested on those platforms.
 
 ## Design notes
 
-The Stop hook returns in about 40ms, because all the real work happens in a
-detached child process and Claude Code is never left waiting on it. Time to
-first audio is roughly 0.5s. The audio player starts first and waits for the
-file to appear, so its own startup overlaps with synthesis. The file is then
-renamed into place atomically, which means the player can never read a half
-written file.
+The Stop hook returns in under 90ms, because all the real work happens in a
+detached child process and Claude Code is never left waiting on it.
+
+The reply is spoken in pieces rather than as one lump. The first piece is a
+single sentence, so the first sound arrives once a dozen words have been
+synthesised instead of the whole answer; the rest are synthesised while that
+opening sentence is still playing. On a short reply that takes time to first
+audio from about 3.3s down to about 1.1s, and the saving grows with length.
+Roughly a second of that is the speech service connecting, which is the floor.
+
+The player starts before the first piece exists and waits for it, so its own
+startup overlaps synthesis too. Each piece is renamed into place atomically,
+so the player can never read a half written file, and a marker file tells it
+when there is nothing more coming.

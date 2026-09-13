@@ -453,72 +453,68 @@ def find_player():
     return None
 
 
+def _chunks(text, opener=1, size=300):
+    """Split a reply into pieces that can be spoken as they become ready.
+
+    The first piece is a single sentence, so the first sound arrives after
+    synthesising a dozen words rather than the whole reply. The rest go in
+    larger pieces, synthesised while the opening is still playing.
+    """
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+    if not parts:
+        return []
+    out = [" ".join(parts[:opener])]
+    buf = ""
+    for part in parts[opener:]:
+        buf = (buf + " " + part) if buf else part
+        if len(buf) >= size:
+            out.append(buf)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+
+def _tidy_previous():
+    """Sweep leftovers and kill the old Windows player. Runs on its own
+    thread so the taskkill spawn overlaps the wait for the reply text, but
+    it must finish before we start a player of our own: both write their
+    pid to the same fixed-name file, so a late kill would shoot ours."""
+    sweep_stale()
+    stop_windows()
+
+
 def _neural_posix(text):
-    """macOS / Linux: synthesise, then hand the file to a local player."""
+    """macOS / Linux: play each piece as it is synthesised, and synthesise
+    the next one while it plays, so speaking starts on the first sentence."""
     argv = find_player()
     if not argv:
         return False
     import tempfile
-    base = os.path.join(tempfile.gettempdir(), "cc_speak_%d.mp3" % os.getpid())
-    part = base + ".part"
-    TEMP_FILES.extend((part, base))
-    try:
-        if not synthesize(text, part):
-            return False
-        os.replace(part, base)
-        subprocess.run([a.replace("{f}", base) for a in argv],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except (OSError, subprocess.SubprocessError):
+    pieces = _chunks(text)
+    if not pieces:
         return False
-    finally:
-        for f in (part, base):
-            try:
-                os.unlink(f)
-            except OSError:
-                pass
-
-
-def _neural_wsl(text):
-    """WSL: the Windows player starts first and waits for the file, so its
-    ~0.3s startup overlaps synthesis instead of following it."""
-    tmp = win_temp()
-    if not tmp:
-        return False
-    wsl_dir, win_dir = tmp
-    name = "cc_speak_%d.mp3" % os.getpid()
-    wsl_mp3 = os.path.join(wsl_dir, name)
-    wsl_part = wsl_mp3 + ".part"
-    win_mp3 = win_dir.rstrip("\\") + "\\" + name
-    win_pid = win_dir.rstrip("\\") + "\\" + WINPID_NAME
-    cap = len(text) / CHARS_PER_SEC + 6
-    TEMP_FILES.extend((wsl_part, wsl_mp3))
-    ps = (
-        f"$PID | Out-File -FilePath '{win_pid}' -Encoding ascii;"
-        "Add-Type -AssemblyName presentationCore;"
-        "$p=New-Object System.Windows.Media.MediaPlayer;"
-        "$n=0;"
-        f"while(-not (Test-Path '{win_mp3}')){{Start-Sleep -Milliseconds 20;"
-        "$n++; if($n -gt 1500){exit 1}};"
-        f"$p.Open([uri]'{win_mp3}');"
-        "$n=0;"
-        "while(-not $p.NaturalDuration.HasTimeSpan -and $n -lt 150)"
-        "{Start-Sleep -Milliseconds 20; $n++};"
-        f"$d={cap:.1f};"
-        "if($p.NaturalDuration.HasTimeSpan)"
-        "{$d=$p.NaturalDuration.TimeSpan.TotalSeconds};"
-        "$p.Play(); Start-Sleep -Seconds ($d+0.3); $p.Close()"
-    )
+    stem = os.path.join(tempfile.gettempdir(), "cc_speak_%d_" % os.getpid())
+    made = []
     player = None
     try:
-        player = subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if not synthesize(text, wsl_part):
-            player.kill()
-            return False
-        os.replace(wsl_part, wsl_mp3)   # atomic: player never sees a partial file
-        player.wait(timeout=cap + 120)
+        for i, piece in enumerate(pieces):
+            out = "%s%d.mp3" % (stem, i)
+            part = out + ".part"
+            TEMP_FILES.extend((part, out))
+            made.extend((part, out))
+            if not synthesize(piece, part):
+                if i == 0:
+                    return False
+                break            # keep what played rather than losing it all
+            os.replace(part, out)
+            if player:
+                player.wait()    # this piece was synthesised while that played
+            player = subprocess.Popen(
+                [a.replace("{f}", out) for a in argv],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if player:
+            player.wait()
         return True
     except (OSError, subprocess.SubprocessError):
         if player:
@@ -528,7 +524,89 @@ def _neural_wsl(text):
                 pass
         return False
     finally:
-        for f in (wsl_part, wsl_mp3):
+        for f in made:
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def _neural_wsl(text):
+    """WSL: the Windows player walks a playlist, waiting for each piece to
+    appear. Its ~0.3s startup overlaps the first piece's synthesis, and the
+    remaining pieces are synthesised while the opening sentence plays."""
+    tmp = win_temp()
+    if not tmp:
+        return False
+    wsl_dir, win_dir = tmp
+    pieces = _chunks(text)
+    if not pieces:
+        return False
+    stem = "cc_speak_%d_" % os.getpid()
+    wsl_stem = os.path.join(wsl_dir, stem)
+    win_stem = win_dir.rstrip("\\") + "\\" + stem
+    wsl_done = wsl_stem + "done"
+    win_done = win_stem + "done"
+    win_pid = win_dir.rstrip("\\") + "\\" + WINPID_NAME
+    piece_cap = max(len(p) for p in pieces) / CHARS_PER_SEC + 4
+    total_cap = len(text) / CHARS_PER_SEC + 20
+    made = [wsl_done]
+    TEMP_FILES.append(wsl_done)
+    ps = (
+        f"$PID | Out-File -FilePath '{win_pid}' -Encoding ascii;"
+        "Add-Type -AssemblyName presentationCore;"
+        "$p=New-Object System.Windows.Media.MediaPlayer;"
+        "$i=0;"
+        "while($true){"
+        f"$f='{win_stem}'+$i+'.mp3';"
+        "$n=0;"
+        "while(-not (Test-Path $f)){"
+        # read the marker BEFORE sleeping, re-check the file after: a piece
+        # is renamed into place before the marker is written, so seeing the
+        # marker and then no file means there is genuinely nothing left
+        f"$fin=Test-Path '{win_done}';"
+        "Start-Sleep -Milliseconds 20;"
+        "if($fin -and -not (Test-Path $f)){$p.Close(); exit 0};"
+        "$n++; if($n -gt 1500){$p.Close(); exit 1}};"
+        "$p.Open([uri]$f);"
+        "$n=0;"
+        "while(-not $p.NaturalDuration.HasTimeSpan -and $n -lt 150)"
+        "{Start-Sleep -Milliseconds 20; $n++};"
+        f"$d={piece_cap:.1f};"
+        "if($p.NaturalDuration.HasTimeSpan)"
+        "{$d=$p.NaturalDuration.TimeSpan.TotalSeconds};"
+        "$p.Play(); Start-Sleep -Seconds ($d+0.15); $i++}"
+    )
+    player = None
+    try:
+        player = subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        spoken = 0
+        for i, piece in enumerate(pieces):
+            out = "%s%d.mp3" % (wsl_stem, i)
+            part = out + ".part"
+            TEMP_FILES.extend((part, out))
+            made.extend((part, out))
+            if not synthesize(piece, part):
+                break
+            os.replace(part, out)   # atomic: never a half-written file
+            spoken += 1
+        open(wsl_done, "w").close()  # nothing more is coming
+        if not spoken:
+            player.kill()
+            return False
+        player.wait(timeout=total_cap + 120)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        if player:
+            try:
+                player.kill()
+            except OSError:
+                pass
+        return False
+    finally:
+        for f in made:
             try:
                 os.unlink(f)
             except OSError:
@@ -731,14 +809,15 @@ def main():
 
         signal.signal(signal.SIGTERM, _cleanup)
         signal.signal(signal.SIGINT, _cleanup)
-        sweep_stale()
-        stop_windows()   # off the critical path, but before we make noise
+        import threading
+        tidy = threading.Thread(target=_tidy_previous, daemon=True)
+        tidy.start()     # the taskkill spawn overlaps the wait below
         text = reply_text(transcript)
+        if text:
+            text = speakable(text)
+        tidy.join(timeout=30)   # never start our player while that is running
         if not text:
             return       # a turn that ended on a tool call has nothing to say
-        text = speakable(text)
-        if not text:
-            return
         try:
             if not speak_neural(text):
                 speak_builtin(text)   # text is held in memory, so a failed
