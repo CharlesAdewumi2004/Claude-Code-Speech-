@@ -49,6 +49,31 @@ Short ambiguous messages such as "yes" or "do that" never flip the decision.
 They inherit whatever the last clear message decided, so the mode won't flicker
 on you.
 
+## A stop button
+
+`/shush` stops playback, but so does anything else you send: the plugin cuts
+the audio the moment you submit a prompt, so even a single character and enter
+will do it. That covers most cases without a shortcut.
+
+For a real key, bind one in your terminal rather than in Claude Code. Claude
+Code's own keybindings map keys to a fixed set of built in actions and none of
+them runs a slash command, so the binding has to live a layer below. In Windows
+Terminal, add an action that types the command for you:
+
+```json
+"actions": [
+  { "command": { "action": "sendInput", "input": "/speech:shush\r" },
+    "id": "User.shushClaude", "name": "Shush Claude" }
+],
+"keybindings": [
+  { "id": "User.shushClaude", "keys": "ctrl+shift+s" }
+]
+```
+
+The `\r` is what presses enter. Other terminals have an equivalent: iTerm2 calls
+it "Send Text", and most Linux terminals expose it through their profile
+shortcuts.
+
 ## Replies written for the ear
 
 A reply written to be read never quite sounds right out loud, however much
