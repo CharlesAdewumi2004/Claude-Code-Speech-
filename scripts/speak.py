@@ -32,7 +32,7 @@ RATE = os.environ.get("CLAUDE_SPEECH_RATE", "+8%")
 MAX_CHARS = int(os.environ.get("CLAUDE_SPEECH_MAX_CHARS", "3000"))
 CHARS_PER_SEC = 13.0           # rough read speed, used only as a safety cap
 REPLY_WAIT = float(os.environ.get("CLAUDE_SPEECH_REPLY_WAIT", "2.0"))
-REPLY_POLL = 0.05              # how often to re-read while the reply lands
+REPLY_POLL = 0.015             # only paid when the reply has not landed yet
 PRIME = os.environ.get("CLAUDE_SPEECH_PRIME", "1") not in ("0", "false", "no")
 # --------------------------------------------------------------------------
 
@@ -506,6 +506,17 @@ def _tidy_previous():
     stop_windows()
 
 
+def _prewarm():
+    """Import edge_tts up front. It costs ~130ms, and synthesise() would
+    otherwise pay it after the reply text is in hand, where nothing else
+    is happening. Here it overlaps the read instead. Failure is fine:
+    synthesise() imports it again and falls back to the system voice."""
+    try:
+        import edge_tts            # noqa: F401
+    except Exception:
+        pass
+
+
 def _neural_posix(text):
     """macOS / Linux: play each piece as it is synthesised, and synthesise
     the next one while it plays, so speaking starts on the first sentence."""
@@ -846,6 +857,7 @@ def main():
         import threading
         tidy = threading.Thread(target=_tidy_previous, daemon=True)
         tidy.start()     # the taskkill spawn overlaps the wait below
+        threading.Thread(target=_prewarm, daemon=True).start()
         text = reply_text(transcript)
         if text:
             text = speakable(text)

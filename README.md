@@ -173,3 +173,14 @@ The player starts before the first piece exists and waits for it, so its own
 startup overlaps synthesis too. Each piece is renamed into place atomically,
 so the player can never read a half written file, and a marker file tells it
 when there is nothing more coming.
+
+Anything that can be done early is. Importing the speech library costs about
+130ms, so the child starts that on its own thread while it reads the reply out
+of the transcript, rather than paying for it afterwards when nothing else is
+happening. The sweep and the kill of any previous playback run on a thread of
+their own for the same reason.
+
+The wait for the reply to land is a ceiling, not a cost. When the text is
+already in the transcript the read returns in well under a millisecond, so
+shortening the budget would buy nothing and would only make the plugin give up
+early on the occasions when the transcript genuinely lags behind.
