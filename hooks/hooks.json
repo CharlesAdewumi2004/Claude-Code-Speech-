@@ -20,6 +20,11 @@
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" --stop",
             "timeout": 20,
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" --prime",
+            "timeout": 5
           }
         ]
       }

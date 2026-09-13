@@ -49,6 +49,22 @@ Short ambiguous messages such as "yes" or "do that" never flip the decision.
 They inherit whatever the last clear message decided, so the mode won't flicker
 on you.
 
+## Replies written for the ear
+
+A reply written to be read never quite sounds right out loud, however much
+markdown you strip out of it afterwards. So when the plugin knows it is about to
+speak, it says so before the answer is written. A hook on your prompt asks for
+spoken prose: a few sentences, no headings or bullet lists, file paths described
+rather than spelled out, and discussion in place of a wall of code.
+
+The work still happens. Claude still edits files and runs commands when you ask,
+it just tells you what it did instead of reading the diff back to you. When an
+answer genuinely needs code, it offers it rather than reciting it.
+
+This uses the same judgement that decides whether to speak at all, so a typed
+message is untouched. Set `CLAUDE_SPEECH_PRIME=0` to turn it off and go back to
+speaking whatever would have been written anyway.
+
 ## What it strips before speaking
 
 Code blocks, URLs, markdown syntax and file paths are all cleaned up before the
@@ -64,13 +80,37 @@ Environment variables, all optional:
 |---|---|---|
 | `CLAUDE_SPEECH_VOICE` | `en-US-AndrewNeural` | Any edge-tts voice |
 | `CLAUDE_SPEECH_RATE` | `+8%` | Speaking speed |
-| `CLAUDE_SPEECH_MAX_CHARS` | `450` | Cut-off length |
+| `CLAUDE_SPEECH_MAX_CHARS` | `1200` | Cut-off length |
 | `CLAUDE_SPEECH_HOME` | `~/.claude/speech` | Where state lives |
 | `CLAUDE_SPEECH_REPLY_WAIT` | `2.0` | Seconds to wait for the reply to land |
+| `CLAUDE_SPEECH_PRIME` | `1` | Ask for spoken-style replies |
+| `CLAUDE_SPEECH_MODE` | unset | Override the mode for one terminal |
 
 List the available voices with
 `~/.claude/speech/.venv/bin/edge-tts --list-voices`. The conversational ones
 (Andrew, Brian, Ava, Emma) sound best.
+
+## A voice terminal of its own
+
+The mode lives in a file, so every session shares it. Set `CLAUDE_SPEECH_MODE`
+instead and it applies to one terminal only, which is what makes a spoken
+session and a written session genuinely separate rather than two windows
+fighting over one setting.
+
+```
+voice() {
+  CLAUDE_SPEECH_MODE=on claude --model opus --effort low --name voice "$@"
+}
+```
+
+Effort matters more than the model for how quickly a reply arrives. Claude Code
+defaults high because that suits writing code; conversation does well lower.
+
+Pair it with tap-to-send dictation, so speaking and sending are one gesture:
+
+```json
+"voice": { "enabled": true, "mode": "tap", "autoSubmit": true }
+```
 
 ## Platform support
 

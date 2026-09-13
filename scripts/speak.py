@@ -13,6 +13,7 @@ falling back to whatever the OS ships with.
   --setup                 create the venv and install edge-tts
   --status                report what's installed and which backend is live
   --play <textfile>       internal: synthesis + playback
+  --prime                 internal: ask for a spoken-style reply
   (stdin = Stop payload)  speak the last message if the mode says so
 """
 import json
@@ -28,10 +29,11 @@ import time
 # ---- knobs (env-overridable so users don't edit the file) ----------------
 VOICE = os.environ.get("CLAUDE_SPEECH_VOICE", "en-US-AndrewNeural")
 RATE = os.environ.get("CLAUDE_SPEECH_RATE", "+8%")
-MAX_CHARS = int(os.environ.get("CLAUDE_SPEECH_MAX_CHARS", "450"))
+MAX_CHARS = int(os.environ.get("CLAUDE_SPEECH_MAX_CHARS", "1200"))
 CHARS_PER_SEC = 13.0           # rough read speed, used only as a safety cap
 REPLY_WAIT = float(os.environ.get("CLAUDE_SPEECH_REPLY_WAIT", "2.0"))
 REPLY_POLL = 0.05              # how often to re-read while the reply lands
+PRIME = os.environ.get("CLAUDE_SPEECH_PRIME", "1") not in ("0", "false", "no")
 # --------------------------------------------------------------------------
 
 STATE_DIR = os.path.expanduser(
@@ -41,6 +43,7 @@ VENV_PY = os.path.join(VENV_DIR, "bin", "python")
 PID_FILE = os.path.join(STATE_DIR, "speaking.pid")
 MODE_FILE = os.path.join(STATE_DIR, "mode")
 STICKY_FILE = os.path.join(STATE_DIR, "sticky")
+VERDICT_FILE = os.path.join(STATE_DIR, "verdict")
 SKIP_FILE = os.path.join(STATE_DIR, "skip-once")
 TEMP_CACHE = os.path.join(STATE_DIR, "wintemp")
 WINPID_NAME = "cc_speak_current.pid"   # fixed name: --stop always finds it
@@ -236,6 +239,11 @@ def speakable(text):
 # ---- mode ----------------------------------------------------------------
 
 def read_mode():
+    """The environment wins over the file, so one terminal can be a voice
+    session while another stays silent. Without it both share one mode."""
+    env = os.environ.get("CLAUDE_SPEECH_MODE", "").strip().lower()
+    if env in ("auto", "on", "off"):
+        return env
     try:
         with open(MODE_FILE) as fh:
             mode = fh.read().strip().lower()
@@ -244,11 +252,14 @@ def read_mode():
         return "auto"
 
 
-def should_speak(transcript_path):
+def decide(text):
+    """Should a reply to this message be spoken? The sticky file carries
+    the last clear verdict through ambiguous one-liners like "yes", so
+    the mode doesn't flicker mid-conversation."""
     mode = read_mode()
     if mode != "auto":
         return mode == "on"
-    verdict = looks_dictated(last_user_text(transcript_path))
+    verdict = looks_dictated(text)
     if verdict is None:            # ambiguous -> keep doing what we did
         try:
             with open(STICKY_FILE) as fh:
@@ -262,6 +273,64 @@ def should_speak(transcript_path):
     except OSError:
         pass
     return verdict
+
+
+def should_speak(transcript_path):
+    """Prefer the verdict the prompt hook recorded for this turn. It saw the
+    message as you sent it, while the transcript reader has to find it again
+    and skips anything starting with "<" - so the two could disagree. Consume
+    it, so a stale verdict can never decide a later turn."""
+    try:
+        with open(VERDICT_FILE) as fh:
+            recorded = fh.read().strip()
+        os.unlink(VERDICT_FILE)
+        if recorded in ("0", "1"):
+            return recorded == "1"
+    except OSError:
+        pass
+    return decide(last_user_text(transcript_path))
+
+
+# ---- voice-mode priming --------------------------------------------------
+
+VOICE_STYLE = """This reply is going to be read aloud, so write it to be heard
+rather than read.
+
+Keep it to a few sentences. Use plain spoken prose: no markdown, no headings, no
+bullet lists, no tables, no code blocks in the reply text.
+
+Name things the way you would say them out loud. Say "the reply function in the
+speak script" rather than spelling out a file path, and describe what a command
+does instead of reciting its flags.
+
+Lean towards discussion and planning. Do whatever tool work the request needs,
+then say what you did and what you would do next, rather than reproducing the
+code you just wrote.
+
+If the answer genuinely needs code or a long structured list, say so in a
+sentence and offer it, instead of reading it out."""
+
+
+def do_prime():
+    """UserPromptSubmit hook. When this message is one we'd speak, ask for
+    a reply shaped for the ear. Cheaper and better than writing a dense
+    reply and stripping it afterwards, which is all speakable() can do."""
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError:
+        return
+    verdict = decide(payload.get("prompt") or "")
+    ensure_state_dir()
+    try:
+        with open(VERDICT_FILE, "w") as fh:
+            fh.write("1" if verdict else "0")
+    except OSError:
+        pass
+    if not PRIME or not verdict:
+        return
+    json.dump({"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": VOICE_STYLE}}, sys.stdout)
 
 
 # ---- windows plumbing (WSL only) -----------------------------------------
@@ -541,17 +610,20 @@ def sweep_stale(max_age=300):
         pass
 
 
-def dispatch(text):
-    """Hand off to a detached child so the hook returns immediately."""
+def dispatch(transcript_path):
+    """Hand off to a detached child so the hook returns immediately.
+
+    The child resolves the reply text itself rather than being handed it.
+    Waiting for the closing block to land is the slow part, and it has no
+    business on the hook's critical path: a turn that ends on a tool call
+    would otherwise stall Claude Code for the whole wait before giving up.
+    """
     stop_local()          # cheap; the child does the Windows-side kill
     ensure_state_dir()
-    txt = os.path.join(STATE_DIR, "say_%d.txt" % os.getpid())
-    with open(txt, "w", encoding="utf-8") as fh:
-        fh.write(text)
     # the venv interpreter has edge_tts importable; plain python3 falls back
     runner = VENV_PY if os.path.exists(VENV_PY) else sys.executable
     proc = subprocess.Popen(
-        [runner, os.path.abspath(__file__), "--play", txt],
+        [runner, os.path.abspath(__file__), "--play", transcript_path],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True)
     with open(PID_FILE, "w") as fh:
@@ -634,6 +706,10 @@ def main():
         print(read_mode())
         return
 
+    if argv and argv[0] == "--prime":
+        do_prime()
+        return
+
     if argv and argv[0] == "--setup":
         do_setup()
         return
@@ -643,13 +719,7 @@ def main():
         return
 
     if len(argv) == 2 and argv[0] == "--play":
-        textfile = argv[1]
-        try:
-            with open(textfile, encoding="utf-8") as fh:
-                text = fh.read()
-        except OSError:
-            return
-        TEMP_FILES.append(textfile)
+        transcript = argv[1]
 
         def _cleanup(signum, frame):
             for f in TEMP_FILES:
@@ -663,16 +733,17 @@ def main():
         signal.signal(signal.SIGINT, _cleanup)
         sweep_stale()
         stop_windows()   # off the critical path, but before we make noise
+        text = reply_text(transcript)
+        if not text:
+            return       # a turn that ended on a tool call has nothing to say
+        text = speakable(text)
+        if not text:
+            return
         try:
             if not speak_neural(text):
                 speak_builtin(text)   # text is held in memory, so a failed
         except Exception:             # neural run can't starve the fallback
             pass
-        finally:
-            try:
-                os.unlink(textfile)
-            except OSError:
-                pass
         return
 
     try:
@@ -688,11 +759,7 @@ def main():
     path = payload.get("transcript_path")
     if not path or not should_speak(path):
         return
-    text = reply_text(path)
-    if text:
-        text = speakable(text)
-        if text:
-            dispatch(text)
+    dispatch(path)
 
 
 if __name__ == "__main__":
